@@ -1,0 +1,233 @@
+#!/usr/bin/ruby
+
+# Dependencies
+require 'yaml'
+require 'filewatcher'
+require 'logger'
+
+# Folders constants
+PATHS = {
+    autoproxy: '/etc/autoproxy.d',
+    haproxy: '/etc/haproxy',
+}
+
+# AutoProxy constants
+AUTOPROXY = {
+    version: '1.0.0',
+    config: YAML.load_file("#{PATHS[:autoproxy]}/configs/autoproxy.yml"),
+    services: "#{PATHS[:autoproxy]}/services/*.*",
+    yamls: "#{PATHS[:autoproxy]}/services/*.yml",
+    https_certs: "#{PATHS[:autoproxy]}/configs/certs",
+}
+
+PARAMS = {
+    log_format: AUTOPROXY[:config]['log_format'],
+    default_http_frontend_opts: AUTOPROXY[:config]['default_http_frontend_opts'],
+    default_http_backend_opts: AUTOPROXY[:config]['default_http_backend_opts'],
+    accept_proxy: AUTOPROXY[:config]['accept_proxy'],
+    ssl_ciphers: AUTOPROXY[:config]['ssl_ciphers'],
+    internal_filters: AUTOPROXY[:config]['internal_filters']
+}
+
+# HAProxy constants
+HAPROXY = {
+    binary: '/usr/sbin/haproxy',
+    header: "#{PATHS[:autoproxy]}/configs/header.cfg",
+    config: "#{PATHS[:haproxy]}/haproxy.cfg"
+}
+
+# Logging helper
+LOGGER = Logger.new(STDOUT)
+LOGGER.level = case AUTOPROXY[:config]['log_level']
+                 when 'debug'
+                   Logger::DEBUG
+                 when 'info'
+                   Logger::INFO
+                 when 'warning'
+                   Logger::WARN
+                 else
+                   Logger::WARN
+               end
+
+def compile_haproxy_config(frontends, backends)
+  # Loading header of haproxy configuration file
+  haproxy_cfg = File.read HAPROXY[:header]
+
+  # Compiling frontends
+  frontends.each do |frontend|
+    haproxy_cfg << "#{frontend}\n"
+  end
+
+  # Compiling backends
+  backends.each do |backend|
+    haproxy_cfg << "#{backend}\n"
+  end
+
+  haproxy_cfg
+end
+
+# Create HAProxy configuration from autoproxy services
+def create_haproxy_config
+
+  LOGGER.debug 'Parsing configurations'
+
+  backups=[]
+  if File.exist?('/etc/autoproxy.d/services/backups.txt')
+    File.readlines('/etc/autoproxy.d/services/backups.txt').each do |line|
+      backups.push(line) if line =~ /[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/
+    end
+  end
+  frontends=[]
+  backends=[]
+  # Build Config
+  LOGGER.debug Dir[AUTOPROXY[:services]]
+  Dir[AUTOPROXY[:yamls]].each do |file|
+    service=YAML.load_file file
+    name=service.keys.first
+    LOGGER.debug name
+    frontends.push("frontend #{name}")
+    if service[name]['protocol'].downcase == "http"
+      frontends.push("  #{PARAMS[:log_format]}")
+      frontends.push("  bind *:#{service[name]['translated_port']} #{PARAMS[:accept_proxy]}")
+      frontends.push("  mode http")
+      PARAMS[:default_http_frontend_opts].each do |opt|
+        frontends.push("  #{opt}")
+      end
+      if service[name]['nolog'] == true
+        frontends.push("   no log")
+      end
+      if service[name]['internal'] == true
+        PARAMS[:internal_filters].each do |intf|
+          frontends.push("  #{intf}")
+        end
+      end
+      if service[name]['filters'] != nil
+        service[name]['filters'].each do |filter,value|
+          if filter.downcase == "host"
+            frontends.push("  acl header_#{filter.downcase}_#{name} hdr_dom(host) #{value}")
+            frontends.push("    use_backend #{name} if header_#{filter.downcase}_#{name}")
+          end
+        end
+      else
+        frontends.push("  default_backend #{name}")
+      end
+      frontends.push("  acl #{name}_use_backup nbsrv(#{name}) lt 1")
+      frontends.push("  use_backend #{name}_backup if #{name}_use_backup")
+    elsif service[name]['protocol'].downcase == nil or service[name]['protocol'].downcase == "tcp"
+      frontends.push("  #{PARAMS[:log_format]}")
+      frontends.push("  bind *:#{service[name]['translated_port']} #{PARAMS[:accept_proxy]}")
+      frontends.push("  mode tcp")
+      frontends.push("  default_backend #{name}")
+      frontends.push("  acl #{name}_use_backup nbsrv(#{name}) lt 1")
+      frontends.push("  use_backend #{name}_backup if #{name}_use_backup")
+    else
+      LOGGER.error 'Unknown protocol, skipping frontend'
+    end
+   
+    frontends.push("\n")
+    #health endpoint
+    frontends.push("frontend #{name}-health")
+    frontends.push("  bind *:#{service[name]['translated_port'].to_i + 1}")
+    frontends.push("  mode http")
+    frontends.push("  default_backend dummy_backend")
+    frontends.push("  option httplog")
+    frontends.push("  option forwardfor except 127.0.0.1/8")
+    frontends.push("  acl #{name}_dead nbsrv(#{name}) lt 1")
+    frontends.push("  monitor-uri /health-check")
+    frontends.push("  monitor fail if #{name}_dead")
+    frontends.push("\n")
+  
+    #backend
+    backends.push("backend #{name}")
+    if service[name]['protocol'].downcase == "http"
+      backends.push("  mode http")
+      backends.push("  balance roundrobin")
+      PARAMS[:default_http_backend_opts].each do |opt|
+        backends.push("  #{opt}")
+      end
+    elsif service[name]['protocol'] == nil or service[name]['protocol'].downcase == "tcp"
+      backends.push("  mode tcp")
+      backends.push("  balance roundrobin")
+    end
+    if service[name]['instances'] != nil and service[name]['instances'].size > 0
+      service[name]['instances'].each do |instance|
+        backends.push("  server #{name}_#{instance.split(':').first} #{instance} check inter 1000")
+      end
+    end
+    if PARAMS[:accept_proxy] == 'accept-proxy'
+      send_proxy='send-proxy'
+    else
+      send_proxy=''
+    end
+    backends.push("\n")
+    backends.push("backend #{name}_backup")
+    if service[name]['protocol'].downcase == "http"
+      backends.push("  mode http")
+      backends.push("  balance roundrobin")
+      PARAMS[:default_http_backend_opts].each do |opt|
+        backends.push("  #{opt}")
+      end
+    elsif service[name]['protocol'] == nil or service[name]['protocol'].downcase == "tcp"
+      backends.push("  mode tcp")
+      backends.push("  balance roundrobin")
+    end
+    backends.push("  option httpchk HEAD /health-check HTTP/1.1")
+    backends.push("  no option log-health-checks")
+    if backups.size() > 0
+      backups.each_with_index do |backup,index|
+        backends.push("  server #{name}_backup#{index} #{backup.strip()}:#{service[name]['translated_port']} #{send_proxy} check port #{service[name]['translated_port'].to_i + 1} inter 1000")
+      end
+    end
+    backends.push("\n")
+  end
+
+  # Generating and writing final configuration files, for master...
+  haproxy_config = compile_haproxy_config frontends, backends
+  File.write HAPROXY[:config], haproxy_config
+
+  LOGGER.debug "Master HAProxy configuration file generated :\n\n#{haproxy_config}\n"
+end
+
+# Fork HAProxy and return its PID
+def start_haproxy(config_file)
+  LOGGER.info 'Starting up HAProxy...'
+  pid = fork do
+    exec "#{HAPROXY[:binary]} -f #{config_file}"
+  end
+  LOGGER.debug "Forked haproxy (#{config_file}) with PID : #{pid}"
+  pid
+end
+
+# Entry point
+def main
+  LOGGER.info "Starting up AutoProxy, version #{AUTOPROXY[:version]}"
+  pid = spawn('/var/getbackups.sh')
+  Process.detach(pid)
+  pid = spawn('/usr/sbin/crond -b -L /dev/null')
+  Process.detach(pid)
+
+  # Creating haproxy configuration file
+  create_haproxy_config
+
+  # Starting master HAProxy process...
+  haproxy_pid = start_haproxy HAPROXY[:config]
+
+  # Wait 2 second for HAProxy to start up
+  sleep 2
+
+  # Watching for file changes, (blocking)
+  FileWatcher.new(AUTOPROXY[:services]).watch do
+    LOGGER.debug 'File modification detected !'
+
+    # Creating haproxy configuration file
+    create_haproxy_config
+
+    LOGGER.debug "Graceful reload of HAProxy"
+    haproxy_pid = fork do
+      exec "#{HAPROXY[:binary]} -f #{HAPROXY[:config]} -sf #{haproxy_pid}"
+    end
+  end
+end
+
+# Calling entry point
+main

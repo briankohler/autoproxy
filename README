@@ -1,0 +1,86 @@
+Dynamic HAProxy:
+----------------
+
+This repo builds a container with HAProxy and a small ruby script that watches a directory for changes to yaml files.
+The YAML files are Consul template renderings of services registered in Consul.
+
+The intention was to solve several problems:
+  - Allow any container, including multiple instances of the same container, to run on a Docker host
+  - Remove any need to statically define translated ports on a per-application basis
+  - Not require any need for cross-node coordination or communication
+  - Gracefully drain services during version and configuration updates.
+  - Allow for the leveraging of HAProxy features that exceed the capabilities of ELBs/ALBs
+  - Allow for the configuation of an application to be in one place, from the front-end LB rules down to config values
+
+While there are many ways to implement this, it was implemented in the following manner (all ELBs in proxy-passthru mode, haproxy does the work):
+
+                 *.domain_one.com          *.domain_two.com  (HTTPS/443)
+
+                   ----------                 ---------- 
+                   | public |                 | public |          PUBLIC
+                   |  ELB   |                 |  ELB   |          SUBNET
+                   ---------                  ----------
+                       |                          |
+---------------------------------------------------------------------------------------
+                       |                          |  (SSL_OFFLOAD/L7 header/path matching)
+                  ---------------------------------------- 
+                 |              autoscaling group        |
+                 |                 of Autoproxy nodes    |        PRIVATE_SUBNET
+                 |          (distributed load balancing) |        
+                 -----------------------------------------
+                       |                         |  
+                       | (HTTP/80)               |  (HTTP/80)
+                   ----------                 ---------- 
+                   | svc_one|                 | svc_two|        
+                   | private|                 | privat |          PUBLIC 
+                   |  ELB   |                 |  ELB   |          SUBNET
+                   ---------                  ----------
+                     |  (dynamic port)           |
+                     |  (health=dyn port + 1)    |
+                     |                           |
+         ------------------------------------------------------------------
+         |              autoscaling group of docker nodes                 |  Autoproxy on each node forwards traffic
+         |                 each group == "pod"                            |  to individual container instances
+         |any number of apps assigned to one or more pods,occupying a slot|
+         |               each node fronted with an instance of autoproxy  |
+         -----------------------------------------------------------------
+
+Explaination
+
+In the public subnet, an ELB is setup in proxy-passthru mode on a per domain basis.  AWS scales these under the hood.
+Public DNS for one or more domains is pointed any of these ELBS.
+
+The public ELBs proxy traffic to an autoscaling group of dedicated AutoProxy nodes.  This is effectively a distributed
+load balancer.  SSL offload happens here, leveraging SNI, as well as host header/path matching for traffic routing, and
+various Ddos and abuse mitigation configs as necessary.  In this capacity, consul-template dynamically loads data on a per-
+application basis and alters HAProxy config.  This layer is largely static.  
+
+The distributed load balancer passes traffic to one or more per-application passthru ELBs according to routing rules
+ via a convention-based DNS name.  
+
+The docker nodes are grouped into autoscaling groups called "pods".  By configuration, docker applications are assigned to
+one or more pods (pods groups are named alpha,beta,gamme, etc), and in doing so, occupy a slot.  Each slot equates to a randomly
+generated (but static after generation) port, uniquely identifying each app across the nodes of the scaling group.
+
+Each node of the docker node autoscaling group has AutoProxy running in --net=host mode.  It has as many front-end listeners
+as there are applications assigned to each pod group.  The backends are the local docker ip:native_port of each app.  In addition,
+AutoProxy has a frontend listener on each intermediary port + 1, which serves as a haproxy rule-based health check.  
+
+
+Flow:
+
+This was implemented with Puppet, but could be anything.  Terraform was used to setup AWS infrastructure pieces, including tagging 
+nodes.  Those tags were the bridge between Terraform and Puppet, which used those tags to determine which containers were where, 
+swarm filters,etc.
+
+Add a new app to the system:
+Adding a new app to the system would populate the consul tree that the front door AutoProxy nodes get their config from.  This would 
+include host header regex pattern matches and SSL config.  Upon being inserted into consul, the front end listener would be ready
+on the distributed load balancer.
+Apps are defined with a num_instances property (a minumum number of container instances) and an array of pod groups assigned.  Thus,
+containers are Swarm-booted against nodes with a filter pod={desired pod group names).  When the containers start on any node, consul-
+template writes the config to autoproxy's watched directory when the container instance is healthy.  Therefore, consul is responsibile
+for pulling unhealthy container instances out of the node's autoproxy config.  The internal ELB in front of the nodes is checking /health
+on port+1, which is an haproxy-based health check that says "healthy if at least on instance of container_type is running".
+In addition, docker hosts dynamically find IPs of two neighboring pod group members that are added as last backup backends, so when containers
+die, bleed traffic goes to neighboring nodes seamlessly.  Proper container starts/stops trigger haproxy connection drains for smooth deploys.
