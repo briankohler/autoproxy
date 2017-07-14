@@ -1,0 +1,12 @@
+---
+applicationname:
+  protocol: HTTP
+  native_port: 8080
+  translated_port: 8010
+  internal: false
+  instances:
+    - "172.17.0.2:8080"
+    - "172.17.0.3:8080"
+    - "172.17.0.4:8080"
+
+
